@@ -7,25 +7,28 @@ import time
 import urllib.error
 import urllib.request
 import uuid
+from dotenv import load_dotenv
 import webbrowser
 from datetime import datetime, timezone
 from pathlib import Path
 
 import psutil
 
-try:  # pip install plyer (optionnel : notifications bureau)
+try: 
     from plyer import notification as desktop_notification
 except ImportError:
     desktop_notification = None
 
-# --- Configuration ---------------------------------------------------------
+load_dotenv()
+
 BASE_DIR = Path.home() / ".local" / "share" / "MINERVE.CLIENT" if platform.system() != "Windows" else Path.home() / "AppData" / "Local" / "MINERVE.CLIENT"
 CONFIG_FILE = BASE_DIR / "agent_config.json"
 LOG_FILE = BASE_DIR / "agent.log"
 QUEUE_FILE = BASE_DIR / "pending.jsonl"
 
 API_BASE = "https://minerve-project.vanibels.fr"
-# À adapter aux routes réelles de ton API
+BASE_DIR.mkdir(parents=True,exist_ok=True)
+
 ENDPOINTS = {
     "register": "/api/agents/register",
     "measures": "/api/measures",
@@ -34,17 +37,16 @@ ENDPOINTS = {
 }
 API_TIMEOUT = 5
 
-INTERVAL = 30              # secondes entre deux mesures
-TIMEOUT = 3                # timeout des tests de connexion
-SEND_INTERVAL = 300        # envoi groupé des mesures (les incidents partent tout de suite)
-FAILURE_THRESHOLD = 2      # échecs consécutifs avant de déclarer un incident
-PUBLIC_INFO_TTL = 600      # durée du cache IP publique / FAI
-BANDWIDTH_INTERVAL = 1800  # test de débit toutes les 30 min
+INTERVAL = 30
+TIMEOUT = 3
+SEND_INTERVAL = 300
+FAILURE_THRESHOLD = 2
+PUBLIC_INFO_TTL = 600
+BANDWIDTH_INTERVAL = 1800
 BANDWIDTH_BYTES = 2_000_000
 MAX_QUEUE_LINES = 5000
 
-# Champ utilisé comme "FAI" : "org" (organisation du bloc IP, souvent le FAI final)
-# ou "isp" (nom du fournisseur tel que déclaré). À tester selon ton résultat.
+# org ou isp
 FAI_FIELD = "org"
 
 TARGETS = [
@@ -56,8 +58,6 @@ TARGETS = [
 def utc_now():
     return datetime.now(timezone.utc)
 
-
-# --- Config locale ---------------------------------------------------------
 def load_config():
     if CONFIG_FILE.exists():
         try:
@@ -70,8 +70,6 @@ def load_config():
 def save_config(config):
     CONFIG_FILE.write_text(json.dumps(config, indent=2), encoding="utf-8")
 
-
-# --- Interfaces ------------------------------------------------------------
 def guess_kind(name):
     lowered = name.lower()
     if any(key in lowered for key in ("wi-fi", "wifi", "wlan", "wireless")) or lowered.startswith("wl"):
@@ -160,7 +158,6 @@ def http_get_json(host, path, local_ip, https):
 
 def fetch_public_info(local_ip):
     try:
-        # Le palier gratuit d'ip-api.com ne fonctionne qu'en HTTP
         data = http_get_json(
             "ip-api.com",
             "/json/?fields=status,query,isp,org,as,asname,city,country",
@@ -199,7 +196,6 @@ def fetch_public_info(local_ip):
 
 
 def measure_bandwidth(local_ip):
-    """Débit descendant approximatif en Mbit/s (petit fichier, mesure indicative)."""
     connection = http.client.HTTPSConnection(
         "speed.cloudflare.com", timeout=10, source_address=(local_ip, 0)
     )
@@ -262,15 +258,12 @@ def check_internet(interface_name):
         "failed_targets": failed_targets,
     }
 
-
-# --- API + file d'attente locale ------------------------------------------
 class ApiClient:
     def __init__(self, uid, token=None):
         self.uid = uid
         self.token = token
 
     def post(self, path, payload):
-        """Retourne (état, données) avec état = ok | retry | rejected."""
         headers = {
             "Content-Type": "application/json",
             "X-Agent-UID": self.uid,
@@ -290,7 +283,6 @@ class ApiClient:
                 raw = response.read().decode("utf-8")
                 return "ok", (json.loads(raw) if raw else {})
         except urllib.error.HTTPError as error:
-            # 5xx : le serveur a un souci, on réessaiera. 4xx : requête refusée.
             return ("retry" if error.code >= 500 else "rejected"), {"http_status": error.code}
         except (urllib.error.URLError, OSError, ValueError):
             return "retry", None
@@ -317,7 +309,6 @@ def enqueue(kind, payload):
 
 
 def flush_queue(api):
-    """Renvoie dans l'ordre ce qui est en attente ; s'arrête au premier échec réseau."""
     if not QUEUE_FILE.exists():
         return
 
@@ -329,13 +320,12 @@ def flush_queue(api):
             item = json.loads(line)
             endpoint = ENDPOINTS[item["kind"]]
         except (ValueError, KeyError):
-            continue  # ligne corrompue : on l'abandonne
+            continue
 
         state, _ = api.post(endpoint, item["payload"])
         if state == "retry":
             remaining = lines[index:]
             break
-        # ok ou rejected : on retire l'élément de la file
 
     remaining = remaining[-MAX_QUEUE_LINES:]
     if remaining:
@@ -351,11 +341,9 @@ def notify(title, message):
         desktop_notification.notify(
             title=title, message=message, app_name="Agent réseau", timeout=8
         )
-    except Exception:  # les backends plyer lèvent des erreurs variées
+    except Exception:
         pass
 
-
-# --- Agent -----------------------------------------------------------------
 class Agent:
     def __init__(self, interface_name, config):
         self.interface_name = interface_name
@@ -377,7 +365,7 @@ class Agent:
         self.first_failure_at = None
         self.in_outage = False
 
-        self.on_report = None  # callback(report) pour brancher l'interface graphique
+        self.on_report = None
 
     def ensure_registered(self):
         if self.config.get("registered") or time.monotonic() < self.next_register_at:
@@ -401,7 +389,6 @@ class Agent:
             save_config(self.config)
             self.open_claim_page()
         elif state == "rejected" and isinstance(data, dict) and data.get("http_status") == 409:
-            # UID déjà pris côté serveur sans que l'agent ait son jeton : on repart sur un nouvel UID
             self.config["uid"] = str(uuid.uuid4())
             self.api.uid = self.config["uid"]
             save_config(self.config)
@@ -418,7 +405,7 @@ class Agent:
         print(f"\nPremière connexion : crée ton compte dans le navigateur pour lier cet appareil.\n{url}\n")
         try:
             webbrowser.open(url)
-        except Exception:  # pas de navigateur disponible : le lien reste affiché
+        except Exception:
             pass
 
     def check_link(self, open_browser=False):
@@ -449,7 +436,7 @@ class Agent:
             self.public_info_ip = local_ip
             self.public_info_at = now
         else:
-            self.public_info_at = now - PUBLIC_INFO_TTL + 60  # nouvel essai dans 1 min
+            self.public_info_at = now - PUBLIC_INFO_TTL + 60
 
     def maybe_measure_bandwidth(self, local_ip):
         if time.monotonic() - self.last_bandwidth_at < BANDWIDTH_INTERVAL and self.last_bandwidth_at:
@@ -458,7 +445,7 @@ class Agent:
         return measure_bandwidth(local_ip)
 
     def send(self, kind, payload):
-        enqueue(kind, payload)  # écriture d'abord : rien n'est perdu si l'envoi échoue
+        enqueue(kind, payload)
         flush_queue(self.api)
 
     def flush_measures(self):
@@ -522,7 +509,7 @@ class Agent:
             "uid": self.config["uid"],
             "kind": self.kind,
             **result,
-            **self.public_info,  # dernières infos connues, utiles même en cas de coupure
+            **self.public_info,
         }
 
         with LOG_FILE.open("a", encoding="utf-8") as file:
@@ -541,7 +528,7 @@ class Agent:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Agent de supervision réseau")
+    parser = argparse.ArgumentParser(description="Minerve-Client")
     parser.add_argument("--choose", action="store_true", help="choisir à nouveau l'interface")
     parser.add_argument("--reset", action="store_true", help="oublier l'enregistrement et se lier à nouveau")
     args = parser.parse_args()
@@ -573,7 +560,7 @@ def main():
             )
             time.sleep(INTERVAL)
     except KeyboardInterrupt:
-        print("\nSurveillance arrêtée.")
+        print("\nLe programme c'est terminé correctement!.")
     finally:
         agent.flush_measures()
 
